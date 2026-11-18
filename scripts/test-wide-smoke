@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Verify Mac-wide WatchRelay from ordinary sockets without changing settings."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+
+IPV4 = "1.1.1.1"
+IPV6 = "2606:4700:4700::1111"
+DOH_HOST = "cloudflare-dns.com"
+DOH_URL = f"https://{DOH_HOST}/dns-query?name=example.com&type=A"
+NET_FAILURE = {6, 7, 28, 35, 52, 55, 56}
+
+
+def run(command, timeout=6):
+    return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+
+
+def route_interface(address):
+    family = "-inet6" if ":" in address else "-inet"
+    result = run(["/sbin/route", "-n", "get", family, address])
+    match = re.search(r"^\s*interface:\s+(\S+)", result.stdout, re.MULTILINE)
+    return match.group(1) if result.returncode == 0 and match else None
+
+
+def wifi_power(device):
+    result = run(["/usr/sbin/networksetup", "-getairportpower", device])
+    match = re.search(r":\s+(On|Off)\s*$", result.stdout)
+    return match.group(1).lower() if result.returncode == 0 and match else None
+
+
+def system_reachability():
+    status = run(["/usr/sbin/scutil", "-r", "0.0.0.0"])
+    network = run(["/usr/sbin/scutil", "--nwi"])
+    match = (re.search(r"^Network interfaces:[ \t]*(.*)$", network.stdout, re.MULTILINE)
+             if network.returncode == 0 else None)
+    return {
+        "reachable": (status.returncode == 0 and status.stdout.startswith("Reachable")
+                      and "Connection Required" not in status.stdout),
+        "interfaces": match.group(1).split() if match else [],
+    }
+
+
+def resolve_fresh(nonce, timeout):
+    # sslip.io returns the embedded IPv4 address for a fresh hostname.
+    name = f"{nonce}.1-1-1-1.sslip.io."
+    query = (
+        "import socket, sys;"
+        "r = socket.getaddrinfo(sys.argv[1], 443, socket.AF_INET, socket.SOCK_STREAM);"
+        "print(*sorted({i[4][0] for i in r}))"
+    )
+    try:
+        result = run([sys.executable, "-c", query, name], timeout)
+    except subprocess.TimeoutExpired:
+        return {"resolved": False, "expected_address": False, "timed_out": True}
+    return {
+        "resolved": result.returncode == 0 and bool(result.stdout.split()),
+        "expected_address": result.returncode == 0 and IPV4 in result.stdout.split(),
+        "timed_out": False,
+    }
+
+
+def fetch(url, timeout, address=None):
+    # Explicitly bypass shell or application proxy configuration. The request
+    # must be carried by macOS routing, or it must fail in a negative phase.
+    command = [
+        "/usr/bin/curl", "-q", "--proxy", "", "--noproxy", "*", "--http1.1",
+        "--connect-timeout", str(timeout), "--max-time", str(timeout),
+        "--max-filesize", "131072", "--silent", "--output", "/dev/null",
+        "--header", "Cache-Control: no-cache",
+        "--write-out", "%{http_code} %{size_download} %{time_appconnect} %{time_total}",
+    ]
+    if address:
+        ipv6 = ":" in address
+        endpoint = f"[{address}]" if ipv6 else address
+        command += [
+            "-6" if ipv6 else "-4", "--resolve", f"{DOH_HOST}:443:{endpoint}",
+            "--header", "Accept: application/dns-json",
+        ]
+    try:
+        result = run([*command, url], timeout + 2)
+    except subprocess.TimeoutExpired:
+        return {"passed": False, "unreachable": False, "process_timed_out": True}
+    try:
+        status, size, tls, elapsed = result.stdout.split()
+        status, size, tls, elapsed = int(status), int(size), float(tls), float(elapsed)
+    except ValueError:
+        return {"passed": False, "unreachable": False, "curl_exit": result.returncode}
+    return {
+        "passed": result.returncode == 0 and status == 200 and size > 0 and tls > 0,
+        "unreachable": result.returncode in NET_FAILURE and status == 0 and tls == 0,
+        "curl_exit": result.returncode,
+        "http_status": status,
+        "download_bytes": size,
+        "tls_seconds": tls,
+        "elapsed_seconds": elapsed,
+    }
+
+
+def fetch_after_startup(url, timeout, address=None):
+    deadline = time.monotonic() + timeout
+    result = fetch(url, timeout, address)
+    first_exit = result.get("curl_exit")
+    attempts = 1
+    while result.get("curl_exit") == 7 and deadline - time.monotonic() > 2:
+        # The Mac's apps can all reconnect at once when the tunnel appears.
+        time.sleep(2)
+        attempts += 1
+        result = fetch(url, max(1, math.ceil(deadline - time.monotonic())), address)
+    return {**result, "attempts": attempts, "first_curl_exit": first_exit}
+
+
+def snapshot(wifi_device, dns_address):
+    dns = run(["/usr/sbin/scutil", "--dns"])
+    servers = re.findall(r"^\s*nameserver\[[0-9]+\]\s*:\s*(\S+)", dns.stdout, re.MULTILINE)
+    return {
+        "wifi": wifi_power(wifi_device),
+        "ipv4_interface": route_interface(IPV4),
+        "ipv6_interface": route_interface(IPV6),
+        "tunnel_dns_present": dns_address in servers if dns.returncode == 0 else None,
+    }
+
+
+def validate(args, before, after, dns, named, ipv4, ipv6, baseline=None):
+    checks = {"stable_routes_and_wifi": before == after}
+    if args.wifi:
+        checks["wifi_matches"] = before["wifi"] == args.wifi
+    if args.phase in ("active", "blocked"):
+        checks["ipv4_routes_into_tunnel"] = before["ipv4_interface"] == args.interface
+        checks["ipv6_routes_into_tunnel"] = before["ipv6_interface"] == args.interface
+        checks["virtual_dns_visible"] = before["tunnel_dns_present"] is True
+    else:
+        checks["virtual_dns_removed"] = before["tunnel_dns_present"] is False
+        if args.interface:
+            checks["tunnel_routes_removed"] = args.interface not in (
+                before["ipv4_interface"], before["ipv6_interface"],
+            )
+    if args.phase in ("baseline", "restored", "active"):
+        checks["fresh_system_dns"] = dns["expected_address"]
+        checks["ordinary_named_https"] = named["passed"]
+        checks["literal_ipv4_https"] = ipv4["passed"]
+        if args.ipv6 != "observe":
+            checks["literal_ipv6_policy"] = ipv6[
+                "passed" if args.ipv6 == "relay" else "unreachable"
+            ]
+    else:
+        checks["fresh_dns_unavailable"] = not dns["resolved"]
+        checks["named_https_unavailable"] = named["unreachable"]
+        checks["literal_ipv4_unavailable"] = ipv4["unreachable"]
+        checks["literal_ipv6_unavailable"] = ipv6["unreachable"]
+    if baseline is not None:
+        checks["routing_matches_baseline"] = before == baseline
+    return checks
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("phase", choices=("baseline", "offline", "active", "blocked", "restored"))
+    parser.add_argument("--interface", metavar="utunN", help="WatchRelay's actual tunnel interface")
+    parser.add_argument("--wifi", choices=("on", "off"), help="require this existing Wi-Fi state")
+    parser.add_argument("--wifi-device", default="en0")
+    parser.add_argument("--dns-address", default="198.18.245.2", help="WatchRelay's virtual DNS resolver address")
+    parser.add_argument("--ipv6", choices=("observe", "relay", "blocked"), default="observe")
+    parser.add_argument("--require-system-path", action="store_true",
+                        help="also verify macOS recognizes the tunnel as an online interface")
+    parser.add_argument("--retry-refusals", action="store_true",
+                        help="retry refused IPv4 and named HTTPS connections during tunnel startup")
+    parser.add_argument("--timeout", type=int, default=18, help="seconds per parallel network check")
+    parser.add_argument("--against", type=Path, help="baseline JSON report to compare after restoring")
+    args = parser.parse_args()
+    if args.interface and not re.fullmatch(r"utun[0-9]+", args.interface):
+        parser.error("--interface must be a macOS utun interface")
+    if args.phase in ("active", "blocked") and not args.interface:
+        parser.error("--interface is required while the tunnel should be active")
+    if args.require_system_path and (args.phase != "active" or args.wifi != "off"):
+        parser.error("--require-system-path needs active mode with Wi-Fi off")
+    if args.retry_refusals and args.phase != "active":
+        parser.error("--retry-refusals requires active mode")
+    if not 3 <= args.timeout <= 60:
+        parser.error("--timeout must be 3 to 60 seconds")
+    try:
+        args.dns_address = str(ipaddress.ip_address(args.dns_address))
+    except ValueError:
+        parser.error("--dns-address must be an IP address")
+    if args.against and args.phase != "restored":
+        parser.error("--against is only valid with the restored phase")
+    if args.phase == "offline":
+        if args.wifi == "on":
+            parser.error("offline requires Wi-Fi off")
+        args.wifi = "off"
+
+    before = snapshot(args.wifi_device, args.dns_address)
+    if args.wifi and before["wifi"] != args.wifi:
+        print(f"Wi-Fi should be {args.wifi}. No traffic probes were sent.", file=sys.stderr)
+        return 2
+    baseline = None
+    if args.against:
+        try:
+            report = json.loads(args.against.read_text())
+            if report["phase"] != "baseline" or not report["passed"]:
+                raise ValueError
+            baseline = report["before"]
+        except (KeyError, OSError, ValueError) as error:
+            parser.error(f"--against needs a passing baseline report ({error})")
+    stamp = datetime.now(timezone.utc)
+    nonce = uuid.uuid4().hex
+    https_fetch = fetch_after_startup if args.retry_refusals else fetch
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        dns_job = pool.submit(resolve_fresh, nonce, args.timeout)
+        named_job = pool.submit(https_fetch, f"https://example.com/?watchrelay={nonce}", args.timeout)
+        ipv4_job = pool.submit(https_fetch, DOH_URL, args.timeout, IPV4)
+        ipv6_job = pool.submit(fetch, DOH_URL, args.timeout, IPV6)
+        dns, named, ipv4, ipv6 = (job.result() for job in (dns_job, named_job, ipv4_job, ipv6_job))
+    after = snapshot(args.wifi_device, args.dns_address)
+    checks = validate(args, before, after, dns, named, ipv4, ipv6, baseline)
+    reachability = system_reachability()
+    if args.require_system_path:
+        checks["macos_reports_online"] = reachability["reachable"]
+        checks["macos_recognizes_tunnel_interface"] = args.interface in reachability["interfaces"]
+    passed = all(checks.values())
+    report = {
+        "time_utc": stamp.isoformat(),
+        "phase": args.phase,
+        "tunnel": args.interface,
+        "tunnel_dns_address": args.dns_address,
+        "before": before,
+        "after": after,
+        "fresh_system_dns": dns,
+        "named_https": named,
+        "literal_ipv4_https": ipv4,
+        "literal_ipv6_https": ipv6,
+        "system_reachability": reachability,
+        "checks": checks,
+        "passed": passed,
+    }
+    folder = Path(__file__).resolve().parents[1] / "evidence" / "wide"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    filename = f"{stamp.strftime('%Y%m%dT%H%M%S%fZ')}-{args.phase}.json"
+    with os.fdopen(os.open(folder / filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        json.dump(report, output, indent=2)
+        output.write("\n")
+    for label, result in checks.items():
+        print(f"{'PASS' if result else 'FAIL'} {label.replace('_', ' ')}")
+    print(folder / filename)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

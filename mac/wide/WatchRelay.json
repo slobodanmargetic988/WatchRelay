@@ -1,0 +1,54 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "watch-dns",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        },
+        "detour": "watch"
+      }
+    ],
+    "rules": [{ "query_type": "AAAA", "action": "predefined", "rcode": "NOERROR" }],
+    "final": "watch-dns"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "watch-tunnel",
+      "address": ["198.18.245.1/30", "fd41:77b7:9855:100::1/126"],
+      "mtu": 1500,
+      "auto_route": true,
+      "dns_mode": "hijack",
+      "route_address": ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"],
+      "route_exclude_address": ["127.0.0.0/8", "::1/128"],
+      "stack": "gvisor"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "watch",
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "version": "5",
+      "network": "tcp"
+    }
+  ],
+  "route": {
+    "rules": [
+      { "port": 53, "action": "hijack-dns" },
+      { "ip_version": 6, "action": "reject", "no_drop": true },
+      { "network": "udp", "action": "reject", "no_drop": true }
+    ],
+    "final": "watch"
+  }
+}

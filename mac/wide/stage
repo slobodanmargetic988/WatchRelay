@@ -1,0 +1,97 @@
+#!/bin/bash
+set -euo pipefail
+export LC_ALL=C
+
+here=$(cd -- "$(dirname -- "$0")" && pwd -P)
+build="$here/build"
+version=1.14.4
+asset_base="https://github.com/SagerNet/sing-box/releases/download/v$version"
+pkg_name="SFM-$version-Apple.pkg"
+pkg_digest=6eb140750dfdc386ebb5da3957e8d8024fee8f2316318b7b7b79e015a088274c
+cli_name="sing-box-$version-darwin-arm64"
+cli_archive_digest=0d8c7f5ed5d587b0f1a5e9772a708ec3bfa4ac4c9329604b01d8d9c2ba406838
+cli_binary_digest=6546126c1759683fe85798da92409215d53c50e0f2b346b4f74a61babc8dbec2
+
+mode=${1:-all}
+if [[ $# -gt 1 || "$mode" != all && "$mode" != sfm && "$mode" != cli ]]; then
+    printf 'Usage: %s [all|sfm|cli]\n' "$0" >&2
+    exit 64
+fi
+if [[ $(/usr/bin/uname -sm) != 'Darwin arm64' ]]; then
+    printf 'This release is pinned for an Apple silicon Mac.\n' >&2
+    exit 1
+fi
+
+/bin/mkdir -p -- "$build"
+scratch=$(/usr/bin/mktemp -d "$build/.stage.XXXXXXXX")
+cleanup() {
+    /bin/rm -f -- "$scratch/$pkg_name" "$scratch/$cli_name.tar.gz" \
+        "$scratch/sing-box" "$scratch/sing-box-LICENSE" "$scratch/WatchRelay-CLI.json"
+    /bin/rmdir -- "$scratch"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+valid_digest() {
+    local actual
+    [[ -f "$1" ]] || return 1
+    actual=$(/usr/bin/shasum -a 256 < "$1")
+    [[ ${actual%% *} == "$2" ]]
+}
+
+require_digest() {
+    if ! valid_digest "$1" "$2"; then
+        printf 'Pinned SHA-256 did not match for %s.\n' "$(basename -- "$1")" >&2
+        exit 1
+    fi
+}
+
+fetch() {
+    /usr/bin/curl -q --proto '=https' --proto-redir '=https' --fail --silent \
+        --show-error --location --connect-timeout 15 --max-time 180 --retry 1 \
+        --output "$scratch/$1" "$asset_base/$1"
+}
+
+if [[ "$mode" != cli ]]; then
+    if ! valid_digest "$build/$pkg_name" "$pkg_digest"; then
+        fetch "$pkg_name"
+        require_digest "$scratch/$pkg_name" "$pkg_digest"
+        /bin/mv -f -- "$scratch/$pkg_name" "$build/$pkg_name"
+    fi
+    /usr/sbin/pkgutil --check-signature "$build/$pkg_name" >/dev/null
+    /usr/sbin/spctl --assess --type install "$build/$pkg_name"
+    printf 'Verified signed, notarized installer: %s\n' "$build/$pkg_name"
+    printf 'WatchRelay profile: %s\n' "$here/WatchRelay.json"
+fi
+
+if [[ "$mode" != sfm ]]; then
+    if ! valid_digest "$build/sing-box" "$cli_binary_digest" ||
+        [[ ! -f "$build/sing-box-LICENSE" ]]; then
+        fetch "$cli_name.tar.gz"
+        require_digest "$scratch/$cli_name.tar.gz" "$cli_archive_digest"
+        /usr/bin/tar -xOzf "$scratch/$cli_name.tar.gz" "$cli_name/sing-box" > "$scratch/sing-box"
+        /usr/bin/tar -xOzf "$scratch/$cli_name.tar.gz" "$cli_name/LICENSE" > "$scratch/sing-box-LICENSE"
+        require_digest "$scratch/sing-box" "$cli_binary_digest"
+        /bin/chmod 755 "$scratch/sing-box"
+        /bin/mv -f -- "$scratch/sing-box" "$build/sing-box"
+        /bin/mv -f -- "$scratch/sing-box-LICENSE" "$build/sing-box-LICENSE"
+    fi
+    "$build/sing-box" check -c "$here/WatchRelay.json"
+    python3 - "$here/WatchRelay.json" "$scratch/WatchRelay-CLI.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    profile = json.load(source)
+# Darwin's more-specific lo0 routes preserve loopback for the standalone
+# client. Keep its installed BSD routes to the four split defaults.
+profile["inbounds"][0].pop("route_exclude_address")
+with open(sys.argv[2], "w", encoding="utf-8") as target:
+    json.dump(profile, target, indent=2)
+    target.write("\n")
+PY
+    "$build/sing-box" check -c "$scratch/WatchRelay-CLI.json"
+    /bin/mv -f -- "$scratch/WatchRelay-CLI.json" "$build/WatchRelay-CLI.json"
+    printf 'Verified local test engine: %s\n' "$build/sing-box"
+fi

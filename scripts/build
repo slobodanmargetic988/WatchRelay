@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+if [[ -z ${JAVA_HOME:-} && -x /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java ]]; then
+  export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+fi
+sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
+if [[ ! -f "$sdk/platforms/android-36/android.jar" ]]; then
+  printf 'Android SDK platform 36 is required. Set ANDROID_HOME to its SDK directory.\n' >&2
+  exit 1
+fi
+export ANDROID_HOME="$sdk"
+./gradlew :watch:assembleDebug "$@"
+./mac/build.sh

@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Run four proxied HTTPS requests while another TCP client stops reading."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import time
+import uuid
+
+
+def read_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("SOCKS proxy closed the test connection")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def slow_client(port):
+    host = "speed.cloudflare.com"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.settimeout(35)
+        sock.connect(("127.0.0.1", port))
+        sock.sendall(bytes([5, 1, 0]))
+        if read_exact(sock, 2) != bytes([5, 0]):
+            raise ConnectionError("SOCKS method negotiation failed")
+        sock.sendall(bytes([5, 1, 0, 3, len(host)]) + host.encode("ascii") + bytes([1, 187]))
+        version, result, flags, address_type = read_exact(sock, 4)
+        if (version, result, flags) != (5, 0, 0) or address_type not in (1, 4):
+            raise ConnectionError(f"SOCKS CONNECT failed with result {result}")
+        read_exact(sock, 6 if address_type == 1 else 18)
+        tls = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        try:
+            request = (
+                f"GET /__down?bytes=1048576&watchrelay={uuid.uuid4()} HTTP/1.1\r\n"
+                f"Host: {host}\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n"
+            )
+            tls.sendall(request.encode("ascii"))
+            return tls
+        except BaseException:
+            tls.close()
+            raise
+    except BaseException:
+        sock.close()
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=1080)
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+
+    request = str(Path(__file__).with_name("test-https"))
+
+    def fetch():
+        return subprocess.run(
+            [request, "relay", "--port", str(args.port), "--max-time", "35"], check=False,
+        ).returncode
+
+    with slow_client(args.port):
+        # Give the response time to fill the slow reader's small receive buffer.
+        time.sleep(2)
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            tasks = [workers.submit(fetch) for _ in range(4)]
+            results = [task.result() for task in tasks]
+    recovery = fetch()
+    print(f"Four requests while slow client held open: {results}. After cancellation: {recovery}.")
+    return int(any(results) or recovery != 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

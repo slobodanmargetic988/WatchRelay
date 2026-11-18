@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Test one HTTPS request with an explicit route and record its outcome."""
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+import uuid
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("route", choices=("relay", "direct"))
+    parser.add_argument("--port", type=int, default=1080)
+    parser.add_argument("--nonce", type=uuid.UUID, default=None)
+    parser.add_argument("--max-time", type=int, default=60)
+    parser.add_argument("--download-bytes", type=int, choices=(8192, 262144, 1048576))
+    parser.add_argument("--limit-rate", type=int, help="cap the transfer at this many bytes per second")
+    parser.add_argument("--expect-sha256", help="require this response digest")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+
+    if not 1 <= args.max_time <= 120:
+        parser.error("max time must be between 1 and 120 seconds")
+
+    if args.limit_rate is not None and args.limit_rate < 1:
+        parser.error("limit rate must be positive")
+    if args.expect_sha256 and not re.fullmatch("[0-9a-fA-F]{64}", args.expect_sha256):
+        parser.error("expected SHA-256 must be 64 hexadecimal characters")
+
+    nonce = args.nonce or uuid.uuid4()
+    url = (
+        f"https://speed.cloudflare.com/__down?bytes={args.download_bytes}&watchrelay={nonce}"
+        if args.download_bytes else f"https://example.com/?watchrelay={nonce}"
+    )
+    proxy = f"socks5h://127.0.0.1:{args.port}" if args.route == "relay" else ""
+    bypass = "" if args.route == "relay" else "*"
+    metrics = "%{http_code} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}"
+    command = [
+        "/usr/bin/curl", "-q", "--http1.1", "--proxy", proxy, "--noproxy", bypass,
+        "--connect-timeout", "35", "--max-time", str(args.max_time),
+        "--max-filesize", "1048576", "--fail",
+        "--silent", "--show-error", "--header", "Cache-Control: no-cache",
+        "--header", "Connection: close",
+        "--write-out", metrics,
+    ]
+    if args.limit_rate:
+        command.extend(["--limit-rate", str(args.limit_rate)])
+    stamp = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory(prefix="watchrelay-https-") as directory:
+        response = Path(directory) / "response"
+        completed = subprocess.run(
+            [*command, "--output", str(response), url],
+            check=False, stdout=subprocess.PIPE, text=True,
+        )
+        body = response.read_bytes() if response.exists() else b""
+
+    values = completed.stdout.split()
+    has_metrics = len(values) == 5
+    digest = hashlib.sha256(body).hexdigest() if body else None
+    size_ok = args.download_bytes is None or len(body) == args.download_bytes
+    digest_ok = not args.expect_sha256 or digest == args.expect_sha256.lower()
+    exit_code = completed.returncode or int(not (size_ok and digest_ok))
+    report = {
+        "time_utc": stamp.isoformat(),
+        "route": args.route,
+        "command": shlex.join([*command, "--output", "<temporary response>", url]),
+        "exit_code": exit_code,
+        "curl_exit_code": completed.returncode,
+        "http_status": int(values[0]) if has_metrics else None,
+        "tcp_connect_s": float(values[1]) if has_metrics else None,
+        "tls_ready_s": float(values[2]) if has_metrics else None,
+        "first_byte_s": float(values[3]) if has_metrics else None,
+        "total_s": float(values[4]) if has_metrics else None,
+        "bytes": len(body),
+        "sha256": digest,
+        "expected_bytes": args.download_bytes,
+        "expected_sha256": args.expect_sha256,
+        "integrity_ok": size_ok and digest_ok,
+    }
+    folder = Path(__file__).resolve().parents[1] / "evidence" / "https"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    filename = f"{stamp.strftime('%Y%m%dT%H%M%S%fZ')}-{args.route}-{nonce}.json"
+    path = folder / filename
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"{args.route}: exit {exit_code}, HTTP {report['http_status']}, "
+        f"{len(body)} bytes in {report['total_s']} s"
+    )
+    print(path)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

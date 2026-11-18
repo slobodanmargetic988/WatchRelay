@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+package=com.weeyuga.watchrelay
+apk="$root/watch/build/outputs/apk/debug/watch-debug.apk"
+adb=${ADB:-adb}
+
+usage() {
+  printf 'Usage: %s {info|install|launch|channel|logs} WATCH_SERIAL\n' "$0" >&2
+  exit 2
+}
+
+[[ $# == 2 ]] || usage
+operation=$1
+serial=$2
+case "$operation" in info|install|launch|channel|logs) ;; *) usage ;; esac
+[[ -n "$serial" && "$serial" != -* ]] || usage
+watch=("$adb" -s "$serial")
+if [[ $("${watch[@]}" get-state) != device ]]; then
+  printf 'The selected device is unavailable. Check wireless debugging and adb devices -l.\n' >&2
+  exit 1
+fi
+if ! "${watch[@]}" shell pm list features | tr -d '\r' | grep -Fx 'feature:android.hardware.type.watch' >/dev/null; then
+  printf 'The selected Android device does not report the watch feature. Check the serial.\n' >&2
+  exit 1
+fi
+
+case "$operation" in
+  info)
+    for key in ro.product.manufacturer ro.product.model ro.build.version.release ro.build.version.sdk ro.product.cpu.abilist; do
+      printf '%s = ' "$key"
+      "${watch[@]}" shell getprop "$key"
+    done
+    printf '\nRadio features\n'
+    "${watch[@]}" shell pm list features | grep -E 'android\.hardware\.(telephony|bluetooth|wifi)' || true
+    ;;
+  install)
+    [[ -r "$apk" ]] || { printf 'Build the debug APK before installing.\n' >&2; exit 1; }
+    "${watch[@]}" install -r "$apk"
+    shasum -a 256 "$apk"
+    ;;
+  launch)
+    "${watch[@]}" shell am start -W -n "$package/.MainActivity"
+    ;;
+  channel)
+    channel=$("${watch[@]}" shell dumpsys bluetooth_manager |
+      sed -nE 's/^ *\[([0-9]+)\] com\.weeyuga\.watchrelay \(RFCOMM\).*$/\1/p' |
+      tail -1)
+    if [[ ! "$channel" =~ ^[0-9]+$ ]]; then
+      printf 'Start a forward WatchRelay session before reading its channel.\n' >&2
+      exit 1
+    fi
+    printf '%s\n' "$channel"
+    ;;
+  logs)
+    # Use a private directory and replace each local copy only after ADB succeeds.
+    umask 077
+    dest="$root/evidence/watch"
+    mkdir -p "$dest"
+    files=$("${watch[@]}" shell run-as "$package" ls files/diagnostics | tr -d '\r')
+    while IFS= read -r filename; do
+      [[ "$filename" =~ ^[a-zA-Z0-9_-]+\.jsonl$ ]] || continue
+      tmp=$(mktemp "$dest/.watchlog.XXXXXX")
+      trap 'rm -f -- "$tmp"' EXIT
+      "${watch[@]}" exec-out run-as "$package" cat "files/diagnostics/$filename" > "$tmp"
+      mv -f -- "$tmp" "$dest/$filename"
+      trap - EXIT
+      printf '%s\n' "$dest/$filename"
+    done <<< "$files"
+    ;;
+esac

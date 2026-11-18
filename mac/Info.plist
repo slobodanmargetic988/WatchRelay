@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>watchrelay</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.weeyuga.watchrelay.mac</string>
+    <key>CFBundleName</key>
+    <string>WatchRelay</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.9-relay</string>
+    <key>CFBundleVersion</key>
+    <string>10</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Connect to your paired Galaxy Watch for WatchRelay tests.</string>
+</dict>
+</plist>

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Open a temporary Chrome profile that sends TCP web requests to WatchRelay."""
+
+import argparse
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url", nargs="?", default="https://example.com/")
+    parser.add_argument("--port", type=int, default=1080)
+    parser.add_argument("--headless", action="store_true",
+                        help="print the page DOM for a browser connectivity check")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    url = urlsplit(args.url)
+    if url.scheme not in {"http", "https"} or not url.hostname or url.username is not None:
+        parser.error("pass an HTTP or HTTPS URL without credentials")
+
+    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if not chrome.is_file():
+        parser.error("Google Chrome was not found in Applications")
+
+    with tempfile.TemporaryDirectory(prefix="watchrelay-chrome-") as profile:
+        command = [
+            str(chrome),
+            f"--user-data-dir={profile}",
+            f"--proxy-server=socks5://127.0.0.1:{args.port}",
+            "--proxy-bypass-list=<-loopback>",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+            "--disable-quic",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if not args.headless:
+            return subprocess.run([*command, args.url], check=False, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL).returncode
+        command.extend(["--headless", "--dump-dom"])
+        result = subprocess.run([*command, args.url], check=False, stdout=subprocess.PIPE)
+        sys.stdout.buffer.write(result.stdout)
+        return result.returncode or int(not result.stdout.strip())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

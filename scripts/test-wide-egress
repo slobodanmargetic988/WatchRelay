@@ -1,0 +1,157 @@
+#!/usr/bin/python3
+"""Check which interfaces see synthetic UDP and IPv6 probes during WatchRelay."""
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import re
+import secrets
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+
+# Documentation addresses keep this capture specific to our synthetic probes.
+IPV4 = "192.0.2.254"
+IPV6 = "2001:db8::254"
+
+
+def interface_active(name):
+    result = subprocess.run(["/sbin/ifconfig", name], capture_output=True, text=True, check=False, timeout=5)
+    return result.returncode == 0 and bool(re.search(r"^\s*status: active\s*$", result.stdout, re.MULTILINE))
+
+
+def route_interface(address):
+    family = "-inet6" if ":" in address else "-inet"
+    result = subprocess.run(
+        ["/sbin/route", "-n", "get", family, address],
+        capture_output=True, text=True, check=False, timeout=5,
+    )
+    match = re.search(r"^\s*interface:\s+(\S+)", result.stdout, re.MULTILINE)
+    return match.group(1) if result.returncode == 0 and match else None
+
+
+class Capture:
+    def __init__(self, interface, packet_filter):
+        self.interface = interface
+        self.process = subprocess.Popen(
+            ["/usr/sbin/tcpdump", "-nn", "-l", "-i", interface, packet_filter],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def ready(self):
+        deadline = time.monotonic() + 3
+        buffer = bytearray()
+        while time.monotonic() < deadline:
+            streams, _, _ = select.select([self.process.stderr], [], [], max(0, deadline - time.monotonic()))
+            if not streams:
+                break
+            data = os.read(self.process.stderr.fileno(), 1024)
+            if not data:
+                break
+            buffer.extend(data)
+            if b"listening on" in buffer:
+                return True
+        return False
+
+    def finish(self):
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGINT)
+        try:
+            output, _ = self.process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            output, _ = self.process.communicate()
+        # Keep packet capture output in memory and retain only probe counts.
+        return output.decode("utf-8", errors="replace")
+
+
+def send_probe(family, kind, address, port):
+    with socket.socket(family, kind) as sock:
+        sock.settimeout(0.5)
+        try:
+            if kind == socket.SOCK_DGRAM:
+                sock.sendto(b"WatchRelay synthetic egress probe", (address, port))
+            else:
+                sock.connect((address, port))
+        except OSError:
+            # An explicit reject is expected. Capture proves which interface
+            # received each probe even when the socket returns an error.
+            pass
+
+
+def counts(output, udp_port, tcp_port):
+    return {
+        "udp_ipv4": sum(f" > {IPV4}.{udp_port}:" in line for line in output.splitlines()),
+        "udp_ipv6": sum(f" > {IPV6}.{udp_port}:" in line for line in output.splitlines()),
+        "tcp_ipv6": sum(f" > {IPV6}.{tcp_port}:" in line for line in output.splitlines()),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interface", required=True, metavar="utunN")
+    parser.add_argument("--observe", action="append", required=True, metavar="INTERFACE",
+                        help="active physical network interface to check. Repeat for each uplink.")
+    args = parser.parse_args()
+    if not re.fullmatch(r"utun[0-9]+", args.interface):
+        parser.error("--interface must identify the active WatchRelay tunnel")
+    observers = sorted(set(args.observe))
+    if any(not re.fullmatch(r"(?:en|bridge)[0-9]+", interface) for interface in observers):
+        parser.error("--observe must name an Ethernet, Wi-Fi or bridge interface")
+    if os.geteuid() != 0:
+        parser.error("a local administrator must run this read-only packet capture")
+    if not all(interface_active(interface) for interface in observers):
+        parser.error("enable each observed interface before the egress check")
+
+    before = {"ipv4": route_interface(IPV4), "ipv6": route_interface(IPV6)}
+    if any(interface != args.interface for interface in before.values()):
+        print("The probe addresses do not both route to the requested tunnel. No packets sent.", file=sys.stderr)
+        return 2
+    udp_port = 49152 + secrets.randbelow(16383)
+    tcp_port = udp_port + 1
+    packet_filter = (
+        f"(udp and dst port {udp_port} and (dst host {IPV4} or dst host {IPV6})) "
+        f"or (tcp and dst port {tcp_port} and dst host {IPV6})"
+    )
+    captures = []
+    readings = {}
+    stamp = datetime.now(timezone.utc)
+    try:
+        for interface in [args.interface, *observers]:
+            capture = Capture(interface, packet_filter)
+            captures.append(capture)
+            if not capture.ready():
+                print(f"Could not start the narrow packet capture on {interface}. No packets sent.", file=sys.stderr)
+                return 2
+        send_probe(socket.AF_INET, socket.SOCK_DGRAM, IPV4, udp_port)
+        send_probe(socket.AF_INET6, socket.SOCK_DGRAM, IPV6, udp_port)
+        send_probe(socket.AF_INET6, socket.SOCK_STREAM, IPV6, tcp_port)
+        time.sleep(1)
+    finally:
+        for capture in captures:
+            readings[capture.interface] = counts(capture.finish(), udp_port, tcp_port)
+
+    after = {"ipv4": route_interface(IPV4), "ipv6": route_interface(IPV6)}
+    checks = {
+        "stable_routes_and_observers": before == after and all(interface_active(name) for name in observers),
+        "tunnel_saw_all_probes": all(count > 0 for count in readings[args.interface].values()),
+        "physical_interfaces_saw_no_probes": all(
+            count == 0 for name in observers for count in readings[name].values()
+        ),
+    }
+    passed = all(checks.values())
+    # Print a JSON summary to stdout when elevated. Let the invoking user
+    # redirect it if needed, so root never creates files in the workspace.
+    report = {"time_utc": stamp.isoformat(), "interfaces": readings, "checks": checks, "passed": passed}
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

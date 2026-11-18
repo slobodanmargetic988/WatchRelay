@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+interface=${1:-en0}
+port=${2:-1080}
+nonce=$(uuidgen)
+wifi_power() { /usr/sbin/networksetup -getairportpower "$interface"; }
+printf 'Waiting up to 2 minutes for Mac Wi-Fi to be turned off. Keep Bluetooth on.\n'
+for ((attempt=0; attempt<120; attempt++)); do
+  if [[ $(wifi_power) == *": Off" ]]; then
+    break
+  fi
+  sleep 1
+done
+[[ $(wifi_power) == *": Off" ]] || { printf 'Mac Wi-Fi stayed on. No test ran.\n'; exit 2; }
+
+"$root/scripts/test-https" direct --nonce "$nonce" --max-time 10 &
+direct_pid=$!
+"$root/scripts/test-https" relay --nonce "$nonce" --port "$port" --max-time 20 &
+relay_pid=$!
+direct_result=0
+relay_result=0
+wait "$direct_pid" || direct_result=$?
+wait "$relay_pid" || relay_result=$?
+[[ $(wifi_power) == *": Off" ]] || { printf 'Mac Wi-Fi came back before the checks finished.\n'; exit 2; }
+printf 'Mac Wi-Fi is still off. You can restore it now.\n'
+if [[ $direct_result -eq 0 || $relay_result -ne 0 ]]; then
+  printf 'Offline check failed (direct exit %s, relay exit %s).\n' "$direct_result" "$relay_result"
+  exit 1
+fi
+printf 'Offline check passed (direct exit %s, relay exit %s).\n' "$direct_result" "$relay_result"
